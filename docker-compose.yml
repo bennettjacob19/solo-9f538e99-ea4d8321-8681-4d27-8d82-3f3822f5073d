@@ -1,0 +1,37 @@
+services:
+  alert-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      ALERT_DB_PATH: /data/alerts.db
+      NOTIFIER_URL: http://notifier:8001
+      WORKER_INTERVAL_SECONDS: "0.5"
+      LOSE_FIRST_N: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - alert-data:/data
+    depends_on:
+      - notifier
+    restart: unless-stopped
+
+  notifier:
+    build:
+      context: .
+      dockerfile: Dockerfile.notifier
+    environment:
+      NOTIFIER_DB_PATH: /data/notifier.db
+      NOTIFIER_PORT: "8001"
+      # 1 = the first delivery attempt of every new notification number gets
+      # an HTTP 500 (receipt lost); the retry with the same number succeeds.
+      LOSE_FIRST_N: "1"
+    ports:
+      - "8001:8001"
+    volumes:
+      - notifier-data:/data
+    restart: unless-stopped
+
+volumes:
+  alert-data:
+  notifier-data:

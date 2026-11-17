@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>告警控制台</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <h1>告警控制台</h1>
+  <nav><a href="http://localhost:8001/" target="_blank">通知端页面 ↗</a></nav>
+</header>
+
+<section class="card">
+  <h2>服务静默</h2>
+  <div id="silence-state" class="muted">加载中…</div>
+  <form id="silence-form">
+    <label>静默时长（秒）
+      <input type="number" id="duration" min="1" step="1" value="60" required>
+    </label>
+    <label>原因
+      <input type="text" id="reason" placeholder="例如：计划内维护">
+    </label>
+    <button type="submit">设置静默截止时间</button>
+    <button type="button" id="clear-silence" class="secondary">立即解除静默</button>
+  </form>
+  <p class="hint">静默期内新触发只更新告警不通知；静默到期自动补发仍在触发且未通知的故障；此前已通知故障的恢复不受静默影响。</p>
+</section>
+
+<section class="card">
+  <h2>告警（按更新时间倒序）</h2>
+  <table id="alerts-table">
+    <thead>
+      <tr><th>指纹</th><th>当前序号</th><th>状态</th><th>轮次</th><th>摘要</th>
+        <th>触发通知</th><th>恢复通知</th><th>更新时间</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>通知发件箱（本地通知端投递状态）</h2>
+  <table id="notifications-table">
+    <thead>
+      <tr><th>通知号</th><th>指纹</th><th>轮次</th><th>类型</th><th>状态</th>
+        <th>尝试次数</th><th>最近错误</th><th>入队时间</th><th>送达时间</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

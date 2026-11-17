@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地通知端</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <h1>本地通知端</h1>
+  <nav><span class="muted">按通知号去重 · 模拟丢回执 · 重启后状态持久化</span></nav>
+</header>
+
+<section class="card">
+  <h2>已收到的通知（最终状态）</h2>
+  <table id="received-table">
+    <thead>
+      <tr><th>通知号</th><th>指纹</th><th>轮次</th><th>类型</th><th>状态</th>
+        <th>摘要</th><th>见到次数</th><th>首次到达</th><th>最近到达</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<script src="/static/notifier.js"></script>
+</body>
+</html>

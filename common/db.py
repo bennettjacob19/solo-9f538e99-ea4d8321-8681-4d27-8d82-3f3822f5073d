@@ -62,6 +62,31 @@ CREATE TABLE IF NOT EXISTS silences (
     reason     TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL
 );
+
+-- Release-gate singleton state. silence_epoch is bumped (inside the same
+-- transaction as the silence write) on every silence set/clear, so a ticket
+-- can detect "a silence operation happened after I was issued" by comparing
+-- one integer. ticket_seq is the monotonic ticket-number counter.
+CREATE TABLE IF NOT EXISTS gate_state (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    silence_epoch INTEGER NOT NULL DEFAULT 0,
+    ticket_seq    INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT OR IGNORE INTO gate_state(id, silence_epoch, ticket_seq) VALUES (1, 0, 0);
+
+CREATE TABLE IF NOT EXISTS gate_tickets (
+    ticket_no     TEXT PRIMARY KEY,
+    created_at    REAL NOT NULL,
+    fingerprints  TEXT NOT NULL,   -- JSON array of fingerprints, request order
+    baseline      TEXT NOT NULL,   -- JSON {fingerprint: {"seq": n, "round": n}}
+    silence_epoch INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'open'
+                  CHECK (status IN ('open', 'released', 'rejected')),
+    job_id        TEXT,            -- pinned at the first confirm
+    reasons       TEXT,            -- JSON array of invalidation reasons
+    decided_at    REAL
+);
 """
 
 

@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -82,6 +83,30 @@ def wait_delivered(fp, expected_count, timeout=10.0):
             return None
         return rows if all(r["status"] == "delivered" for r in rows) else None
     return wait_until(f"{fp} {expected_count} delivered", check, timeout)
+
+
+def gate_issue(fps, expect=None):
+    return http("POST", f"{BASE}/api/gate/tickets", {"fingerprints": fps}, expect=expect)
+
+
+def gate_confirm(ticket_no, job_id, expect=None):
+    return http("POST", f"{BASE}/api/gate/confirm",
+                {"ticket_no": ticket_no, "job_id": job_id}, expect=expect)
+
+
+def gate_tickets():
+    _, data = http("GET", f"{BASE}/api/gate/tickets", expect=200)
+    return {t["ticket_no"]: t for t in data["tickets"]}
+
+
+def fire(fp, seq, summary="fault"):
+    http("POST", f"{BASE}/api/events",
+         {"fingerprint": fp, "seq": seq, "kind": "firing", "summary": summary}, expect=200)
+
+
+def recover(fp, seq, summary="recovered"):
+    http("POST", f"{BASE}/api/events",
+         {"fingerprint": fp, "seq": seq, "kind": "recovery", "summary": summary}, expect=200)
 
 
 class E2ETestCase(unittest.TestCase):
@@ -349,6 +374,207 @@ class E2ETestCase(unittest.TestCase):
              {"fingerprint": fp, "seq": 2, "kind": "firing", "summary": "late again"},
              expect=409)
         self.assertEqual(alert_status(fp)["status"], "recovered")
+
+    # ------------------------------------------------------------------ #
+    # Release gate
+    # ------------------------------------------------------------------ #
+    def test_09_gate_issue_preconditions(self):
+        fp = "svc/gate-pre"
+        fire(fp, 1, "cpu high")
+        # a still-firing alert cannot be gated
+        s, body = gate_issue([fp], expect=409)
+        self.assertEqual(body["error"], "issue_rejected")
+        self.assertTrue(any(r["reason"] == "not_recovered" for r in body["reasons"]))
+        # unknown fingerprints are rejected
+        s, body = gate_issue(["svc/never-existed"], expect=409)
+        self.assertTrue(any(r["reason"] == "unknown_fingerprint" for r in body["reasons"]))
+        # empty selection is a payload error
+        gate_issue([], expect=422)
+
+        recover(fp, 2)
+        # active global silence blocks issuance
+        http("POST", f"{BASE}/api/silence", {"duration_seconds": 30, "reason": "mt"},
+             expect=200)
+        s, body = gate_issue([fp], expect=409)
+        self.assertTrue(any(r["reason"] == "silence_active" for r in body["reasons"]))
+        http("DELETE", f"{BASE}/api/silence", expect=200)
+
+        # all recovered + no silence -> issued, with a baseline snapshot
+        s, t = gate_issue([fp], expect=201)
+        self.assertTrue(t["ticket_no"].startswith("GT-"))
+        self.assertEqual(t["status"], "open")
+        self.assertEqual(t["fingerprints"], [fp])
+        self.assertEqual(t["baseline"][fp], {"seq": 2, "round": 1})
+        self.assertTrue(t["valid_now"])
+
+        # list + single-ticket query
+        listed = gate_tickets()
+        self.assertIn(t["ticket_no"], listed)
+        self.assertEqual(listed[t["ticket_no"]]["status"], "open")
+        s, one = http("GET", f"{BASE}/api/gate/tickets?ticket_no={t['ticket_no']}",
+                      expect=200)
+        self.assertEqual(one["ticket"]["ticket_no"], t["ticket_no"])
+        http("GET", f"{BASE}/api/gate/tickets?ticket_no=GT-999999", expect=404)
+
+    def test_10_gate_confirm_release_and_job_binding(self):
+        fp_a, fp_b = "svc/gate-a", "svc/gate-b"
+        fire(fp_a, 1); recover(fp_a, 2)
+        fire(fp_b, 1); recover(fp_b, 2)
+        _, t = gate_issue([fp_a, fp_b], expect=201)
+        no = t["ticket_no"]
+        self.assertEqual(t["baseline"][fp_a]["seq"], 2)
+
+        # first confirm releases and pins the job
+        _, c1 = gate_confirm(no, "job-1", expect=200)
+        self.assertEqual(c1["decision"], "released")
+        self.assertFalse(c1["replayed"])
+        self.assertEqual(c1["reasons"], [])
+        # same-job retry replays the pinned conclusion
+        _, c2 = gate_confirm(no, "job-1", expect=200)
+        self.assertTrue(c2["replayed"])
+        self.assertEqual(c2["decision"], "released")
+        self.assertEqual(c2["decided_at"], c1["decided_at"])
+        # a different job may not reuse the ticket
+        s, err = gate_confirm(no, "job-2", expect=409)
+        self.assertEqual(err["error"], "job_mismatch")
+        self.assertEqual(err["bound_job_id"], "job-1")
+
+        # a new fault AFTER the confirm must not rewrite the conclusion
+        fire(fp_a, 3, "new fault after release")
+        _, c3 = gate_confirm(no, "job-1", expect=200)
+        self.assertEqual(c3["decision"], "released")
+        self.assertTrue(c3["replayed"])
+        self.assertEqual(gate_tickets()[no]["status"], "released")
+
+        # unknown ticket
+        s, err = gate_confirm("GT-999999", "job-1", expect=404)
+        self.assertEqual(err["error"], "ticket_not_found")
+
+    def test_11_gate_invalidated_by_alert_drift(self):
+        fp = "svc/gate-drift"
+        fire(fp, 1); recover(fp, 2)
+        _, t = gate_issue([fp], expect=201)
+        no = t["ticket_no"]
+
+        # seq + round move after issuance -> first confirm rejects and pins it
+        fire(fp, 3, "fault again")  # round 2 starts
+        _, c = gate_confirm(no, "job-drift", expect=200)
+        self.assertEqual(c["decision"], "rejected")
+        reasons = {r["reason"] for r in c["reasons"]}
+        self.assertIn("seq_changed", reasons)
+        self.assertIn("round_changed", reasons)
+
+        # the rejection stays pinned even after the fault recovers
+        recover(fp, 4)
+        _, c2 = gate_confirm(no, "job-drift", expect=200)
+        self.assertEqual(c2["decision"], "rejected")
+        self.assertTrue(c2["replayed"])
+        self.assertEqual(c2["decided_at"], c["decided_at"])
+        gate_confirm(no, "job-other", expect=409)
+
+        # a fresh ticket on the now-recovered alert confirms cleanly
+        _, t2 = gate_issue([fp], expect=201)
+        _, c3 = gate_confirm(t2["ticket_no"], "job-other", expect=200)
+        self.assertEqual(c3["decision"], "released")
+
+    def test_12_gate_invalidated_by_silence_ops(self):
+        fp = "svc/gate-sil"
+        fire(fp, 1); recover(fp, 2)
+
+        # silence set/clear BEFORE issuance is baked into the baseline epoch
+        http("POST", f"{BASE}/api/silence", {"duration_seconds": 30}, expect=200)
+        http("DELETE", f"{BASE}/api/silence", expect=200)
+        _, t = gate_issue([fp], expect=201)
+        _, c = gate_confirm(t["ticket_no"], "job-sil-1", expect=200)
+        self.assertEqual(c["decision"], "released")
+
+        # set+clear AFTER issuance invalidates, alert state untouched
+        _, t2 = gate_issue([fp], expect=201)
+        http("POST", f"{BASE}/api/silence", {"duration_seconds": 30}, expect=200)
+        http("DELETE", f"{BASE}/api/silence", expect=200)
+        _, c2 = gate_confirm(t2["ticket_no"], "job-sil-2", expect=200)
+        self.assertEqual(c2["decision"], "rejected")
+        self.assertTrue(any(r["reason"] == "silence_changed" for r in c2["reasons"]))
+
+        # even a silence that is never manually cleared invalidates
+        _, t3 = gate_issue([fp], expect=201)
+        http("POST", f"{BASE}/api/silence", {"duration_seconds": 1}, expect=200)
+        _, c3 = gate_confirm(t3["ticket_no"], "job-sil-3", expect=200)
+        self.assertEqual(c3["decision"], "rejected")
+        time.sleep(1.2)  # let the short silence expire for later tests
+
+    def test_13_gate_confirm_atomic_under_concurrency(self):
+        fp = "svc/gate-race"
+        fire(fp, 1); recover(fp, 2)
+
+        def race(ticket_no, jobs, results):
+            def work(job):
+                results.append(gate_confirm(ticket_no, job))
+            threads = [threading.Thread(target=work, args=(j,)) for j in jobs]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+
+        # 8 different jobs race the first confirm: exactly one may win
+        _, t = gate_issue([fp], expect=201)
+        results: list = []
+        race(t["ticket_no"], [f"race-{i}" for i in range(8)], results)
+        oks = [r for r in results if r[0] == 200]
+        conflicts = [r for r in results if r[0] == 409]
+        self.assertEqual(len(oks), 1, f"expected one winner, got {results}")
+        self.assertEqual(len(conflicts), 7)
+        self.assertFalse(oks[0][1]["replayed"])
+        winner = oks[0][1]["job_id"]
+        self.assertEqual(gate_tickets()[t["ticket_no"]]["job_id"], winner)
+        for s, body in conflicts:
+            self.assertEqual(body["error"], "job_mismatch")
+            self.assertEqual(body["bound_job_id"], winner)
+
+        # 8 concurrent first-confirms of the SAME job: one decision, all agree
+        _, t2 = gate_issue([fp], expect=201)
+        results2: list = []
+        race(t2["ticket_no"], ["same-job"] * 8, results2)
+        self.assertTrue(all(s == 200 for s, _ in results2))
+        self.assertTrue(all(b["decision"] == "released" for _, b in results2))
+        self.assertEqual(sum(1 for _, b in results2 if not b["replayed"]), 1)
+        self.assertEqual(len({b["decided_at"] for _, b in results2}), 1)
+
+    def test_14_gate_persists_across_restart(self):
+        fp = "svc/gate-restart"
+        fire(fp, 1); recover(fp, 2)
+        _, t_open = gate_issue([fp], expect=201)
+        _, t_decided = gate_issue([fp], expect=201)
+        gate_confirm(t_decided["ticket_no"], "job-pre-restart", expect=200)
+
+        # restart both services on the same database files
+        self.alert_server.stop_event.set()
+        self.alert_server.shutdown()
+        self.alert_server.server_close()
+        self.notifier_server.shutdown()
+        self.notifier_server.server_close()
+        time.sleep(0.2)
+        type(self).notifier_server = run_notifier_service("127.0.0.1", NOTIFIER_PORT)
+        type(self).alert_server = run_alert_service("127.0.0.1", ALERT_PORT)
+        wait_until("services healthy after gate restart", lambda: (
+            http("GET", f"{BASE}/health")[0] == 200
+            and http("GET", f"{NOTIFIER}/health")[0] == 200
+        ))
+
+        # tickets and pinned outcomes survived
+        tickets = gate_tickets()
+        self.assertEqual(tickets[t_open["ticket_no"]]["status"], "open")
+        decided = tickets[t_decided["ticket_no"]]
+        self.assertEqual(decided["status"], "released")
+        self.assertEqual(decided["job_id"], "job-pre-restart")
+
+        # the open ticket is still confirmable; the decided one still replays
+        _, c = gate_confirm(t_open["ticket_no"], "job-post-restart", expect=200)
+        self.assertEqual(c["decision"], "released")
+        _, c2 = gate_confirm(t_decided["ticket_no"], "job-pre-restart", expect=200)
+        self.assertTrue(c2["replayed"])
+        self.assertEqual(c2["decision"], "released")
+        gate_confirm(t_decided["ticket_no"], "job-other", expect=409)
 
 
 if __name__ == "__main__":

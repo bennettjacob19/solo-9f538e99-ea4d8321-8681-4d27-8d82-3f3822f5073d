@@ -29,6 +29,42 @@
 </section>
 
 <section class="card">
+  <h2>发布门禁</h2>
+  <p class="hint">
+    勾选本次发布涉及的告警指纹：<b>全部已恢复且当前未处于全局静默</b>才可签发票据。
+    签发后若任一指纹的序号/轮次变化，或期间设置、解除过静默，票据在确认时即失效。
+    部署作业携带票据号与作业 ID 调用 <code>POST /api/gate/confirm</code>；
+    首次确认的结论与作业 ID 绑定固定，同作业重试沿用原结论，异作业不得复用。
+  </p>
+  <div id="gate-fp-list" class="gate-fp-list muted">加载中…</div>
+  <form id="gate-issue-form">
+    <button type="submit">签发票据</button>
+  </form>
+  <div id="gate-issue-result" class="gate-result"></div>
+
+  <h3 class="gate-sub">票据状态</h3>
+  <table id="gate-tickets-table">
+    <thead>
+      <tr><th>票据号</th><th>指纹（签发基线）</th><th>签发时间</th><th>状态</th>
+        <th>作业 ID</th><th>结论时间</th><th>失效 / 拒绝原因</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h3 class="gate-sub">部署确认（模拟作业调用）</h3>
+  <form id="gate-confirm-form">
+    <label>票据号
+      <input type="text" id="confirm-ticket" placeholder="GT-000001" required>
+    </label>
+    <label>作业 ID
+      <input type="text" id="confirm-job" placeholder="deploy-2026-001" required>
+    </label>
+    <button type="submit">确认放行</button>
+  </form>
+  <div id="gate-confirm-result" class="gate-result"></div>
+</section>
+
+<section class="card">
   <h2>告警（按更新时间倒序）</h2>
   <table id="alerts-table">
     <thead>

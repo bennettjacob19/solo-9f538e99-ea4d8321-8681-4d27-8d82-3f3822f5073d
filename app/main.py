@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, Literal
 
-from common import service
+from common import gate, service
 from common.config import AppConfig
 from common.db import connect, init_db
 
@@ -87,6 +87,15 @@ class SilenceIn(BaseModel):
     reason: str = ""
 
 
+class GateIssueIn(BaseModel):
+    fingerprints: list[str] = Field(min_length=1)
+
+
+class GateConfirmIn(BaseModel):
+    ticket_no: str = Field(min_length=1)
+    job_id: str = Field(min_length=1)
+
+
 # --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
@@ -145,6 +154,42 @@ def delete_silence() -> dict:
     # the outbox instead of waiting for the next worker tick.
     result["released"] = service.sweep_silences(_conn)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Release gate
+# --------------------------------------------------------------------------- #
+@app.post("/api/gate/tickets", status_code=201)
+def create_gate_ticket(body: GateIssueIn) -> dict:
+    try:
+        return gate.issue_ticket(_conn, body.fingerprints)
+    except gate.GateReject as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.body())
+
+
+@app.get("/api/gate/tickets")
+def list_gate_tickets() -> dict:
+    return {"tickets": gate.list_tickets(_conn)}
+
+
+@app.get("/api/gate/tickets/{ticket_no}")
+def get_gate_ticket(ticket_no: str) -> dict:
+    ticket = gate.get_ticket(_conn, ticket_no)
+    if ticket is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "ticket_not_found",
+                    "message": f"ticket {ticket_no} does not exist"},
+        )
+    return {"ticket": ticket}
+
+
+@app.post("/api/gate/confirm")
+def confirm_gate_ticket(body: GateConfirmIn) -> dict:
+    try:
+        return gate.confirm_ticket(_conn, body.ticket_no, body.job_id)
+    except gate.GateReject as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.body())
 
 
 # --------------------------------------------------------------------------- #

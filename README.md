@@ -58,6 +58,32 @@ python3 -I runner/__main__.py
 - 静默到期（或手动解除）后，worker 只补发**仍在触发且本轮从未通知**的故障；
   静默期内已经恢复的轮次保持静默，不会补发。
 
+## 发布门禁（放行票据）
+
+发布工程师上线前在控制台「发布门禁」卡片勾选本次涉及的告警指纹并签发票据；
+部署作业携带票据号与作业 ID 调用确认 API 获取放行结论。
+
+| 方法/路径 | 说明 |
+| --- | --- |
+| `POST /api/gate/tickets` | 签发票据，body：`{"fingerprints": ["svc/a", "svc/b"]}`，成功返回 201 |
+| `GET /api/gate/tickets` | 票据列表（open 票据附带当前有效性预览 `valid_now`/`current_reasons`） |
+| `GET /api/gate/tickets/{ticket_no}` | 单票据状态（stdlib runner 用 `?ticket_no=` 查询参数） |
+| `POST /api/gate/confirm` | 部署确认，body：`{"ticket_no": "GT-000001", "job_id": "deploy-001"}` |
+
+规则：
+
+- **签发条件**：所选指纹全部存在且已恢复（`recovered`），且当前未处于全局静默；
+  否则 409 并返回逐条原因。签发时快照每个指纹的 `(序号, 轮次)` 基线与当前静默纪元。
+- **确认时失效**：任一指纹的序号或轮次相对基线发生变化，或签发后曾设置、解除过
+  静默（以静默纪元计数，与静默写操作同一事务内递增），票据即失效，结论为 `rejected`。
+- **结论固定**：首次确认把放行/拒绝结论与作业 ID 一起持久化；同作业重试原样返回
+  （`replayed: true`），异作业确认返回 409 `job_mismatch`，不得复用。
+- **一致性**：确认的「读状态 + 写结论」在单个写事务内完成，与事件接入、静默变更
+  互为原子；确认后的新故障不改写已固定的结论。
+- **持久化**：票据与结论存于 SQLite（`gate_tickets`/`gate_state` 表），重启后可查可续用。
+- 确认响应：`{"decision": "released"|"rejected", "reasons": [...], "replayed": bool, ...}`；
+  未知票据 404，载荷非法 422。
+
 ## 通知投递与去重
 
 - 通知号格式：`{fingerprint}#r{round}:{kind}`，同一轮的 firing/recovery 各一个稳定号码，
@@ -83,11 +109,11 @@ python3 -I runner/__main__.py
 ## 目录结构
 
 ```
-common/        # 框架无关的核心逻辑（事件、静默、发件箱、通知端去重）+ SQLite schema
+common/        # 框架无关的核心逻辑（事件、静默、发件箱、发布门禁、通知端去重）+ SQLite schema
 app/           # FastAPI 告警控制台（后台 worker 线程）
 notifier/      # FastAPI 本地通知端（丢回执模拟）
 runner/        # 纯标准库 HTTP runner，复用 common，供无 PyPI 环境运行与自测
-web/           # 两个网页（原生 HTML/CSS/JS，2s 自动刷新）
+web/           # 两个网页（原生 HTML/CSS/JS，2s 自动刷新；控制台含发布门禁卡片）
 tests/e2e.py   # 端到端关键链路自测（真实 HTTP + SQLite，无第三方依赖）
 Dockerfile / Dockerfile.notifier / docker-compose.yml
 ```
@@ -100,4 +126,7 @@ python3 -I tests/e2e.py
 
 覆盖：健康检查与页面/静态资源、幂等/冲突/旧序拒绝、触发恢复全链路、丢回执同号重试、
 静默期抑制触发但恢复照发、静默到期仅补发仍触发告警、恢复后再触发新一轮、
-同指纹顺序投递、进程重启持久化不重不漏、非法载荷校验。
+同指纹顺序投递、进程重启持久化不重不漏、非法载荷校验；
+发布门禁：签发前置条件（未恢复/未知指纹/静默中/空选择）、确认放行与作业绑定、
+序号轮次漂移与静默操作致票据失效、并发首确认原子唯一、同作业重试与异作业拒绝、
+重启后票据与结论可查可续用。

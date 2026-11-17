@@ -5,6 +5,7 @@ import sqlite3
 import time
 from typing import Any, Callable, Optional
 
+from . import gate
 from .db import transaction
 
 VALID_KINDS = ("firing", "recovery")
@@ -204,13 +205,19 @@ def set_silence(
             "reason=excluded.reason, updated_at=excluded.updated_at",
             (until_ts, reason, now),
         )
+        # Same-transaction bump: a gate confirm can never observe the silence
+        # change without the epoch change (or vice versa).
+        gate.bump_silence_epoch(conn)
     return get_silence(conn, now)
 
 
 def clear_silence(conn: sqlite3.Connection, now: Optional[float] = None) -> dict:
     now = time.time() if now is None else now
     with transaction(conn):
-        conn.execute("DELETE FROM silences WHERE id=1")
+        cur = conn.execute("DELETE FROM silences WHERE id=1")
+        if cur.rowcount > 0:
+            # Only an actual unset counts as a silence change for the gate.
+            gate.bump_silence_epoch(conn)
     return {"active": False, "until_ts": None, "reason": None, "now": now}
 
 

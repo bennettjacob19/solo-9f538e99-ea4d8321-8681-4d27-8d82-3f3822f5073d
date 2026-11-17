@@ -14,8 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs
 
-from common import notifier_core, service
+from common import gate, notifier_core, service
 from common.config import AppConfig, NotifierConfig
 from common.db import connect, init_db
 
@@ -74,7 +75,7 @@ class JsonRouter(BaseHTTPRequestHandler):
             return None
 
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path.split("?", 1)[0]
+        path, _, raw_query = self.path.partition("?")
         if path in ("/", "/index.html"):
             self._file(self.static_index, "text/html; charset=utf-8")
             return
@@ -88,9 +89,10 @@ class JsonRouter(BaseHTTPRequestHandler):
             ext = os.path.splitext(target)[1].lower()
             self._file(target, self._CONTENT_TYPES.get(ext, "application/octet-stream"))
             return
+        query = {k: v[0] for k, v in parse_qs(raw_query).items()}
         for method, prefix, handler in self.routes:
             if method == "GET" and path == prefix:
-                self._dispatch(handler, {})
+                self._dispatch(handler, {"query": query})
                 return
         self._json(404, {"error": "not_found"})
 
@@ -116,6 +118,9 @@ class JsonRouter(BaseHTTPRequestHandler):
     def _dispatch(self, handler: Callable[..., Any], body: Any) -> None:
         try:
             result = handler(body)
+        except gate.GateReject as exc:
+            self._json(exc.http_status, exc.body())
+            return
         except (service.Reject, notifier_core.NotifierReject) as exc:
             status = 409 if isinstance(exc, service.Reject) else 422
             self._json(status, {"error": exc.code, "message": exc.message})
@@ -210,6 +215,28 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
         result["released"] = service.sweep_silences(conn)
         return result
 
+    def h_gate_issue(body: Any) -> tuple[int, dict]:
+        if not isinstance(body, dict):
+            raise ValueError("body must be an object")
+        return 201, gate.issue_ticket(conn, body.get("fingerprints"))
+
+    def h_gate_list(body: Any) -> dict:
+        # Single-ticket lookup: GET /api/gate/tickets?ticket_no=GT-000001
+        query = body.get("query", {}) if isinstance(body, dict) else {}
+        ticket_no = query.get("ticket_no")
+        if ticket_no:
+            ticket = gate.get_ticket(conn, ticket_no)
+            if ticket is None:
+                raise gate.GateReject("ticket_not_found",
+                                      f"ticket {ticket_no} does not exist", 404)
+            return {"ticket": ticket}
+        return {"tickets": gate.list_tickets(conn)}
+
+    def h_gate_confirm(body: Any) -> dict:
+        if not isinstance(body, dict):
+            raise ValueError("body must be an object")
+        return gate.confirm_ticket(conn, body.get("ticket_no"), body.get("job_id"))
+
     import os
     web_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
     web_index = os.path.join(web_root, "index.html")
@@ -223,6 +250,9 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
             ("GET", "/api/silence", h_silence_get),
             ("POST", "/api/silence", h_silence_set),
             ("DELETE", "/api/silence", h_silence_clear),
+            ("POST", "/api/gate/tickets", h_gate_issue),
+            ("GET", "/api/gate/tickets", h_gate_list),
+            ("POST", "/api/gate/confirm", h_gate_confirm),
         ],
         "static_index": web_index,
         "static_dir": os.path.join(web_root, "static"),
